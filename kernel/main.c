@@ -21,7 +21,6 @@ static const struct amd_rdma_interface *rdma_interface;
 
 static int ioctl_get_pages(struct file *filp, unsigned long arg) {
   struct gpt_ioctl_get_pages_args params = {0};
-  struct pid *current_pid;
   struct amd_p2p_info *info;
   struct sg_table *sgt;
   struct scatterlist *sg;
@@ -37,20 +36,16 @@ static int ioctl_get_pages(struct file *filp, unsigned long arg) {
   vaddr = params.vaddr;
   len = params.length;
 
-  /* 获取当前进程的PID结构（用于地址空间识别） */
-  current_pid = get_task_pid(current, PIDTYPE_PID);
-
-  /* 获取页大小 */
-  rc = rdma_interface->get_page_size(vaddr, len, current_pid, &page_size);
+  /* Get page size  */
+  rc = rdma_interface->get_page_size(vaddr, len, NULL, &page_size);
   if (rc < 0) {
     pr_err("Get page size: 0x%016llx (len: %llx) failed: %d\n", vaddr, len, rc);
     return rc;
   }
   pr_info("PAGE_SIZE: %lu\n", page_size);
 
-  /* 实际获取物理页 */
-  rc = rdma_interface->get_pages(vaddr, len, current_pid, NULL, &info, NULL,
-                                 NULL);
+  /* Get physical pages */
+  rc = rdma_interface->get_pages(vaddr, len, NULL, NULL, &info, NULL, NULL);
   if (rc < 0) {
     pr_err("Get pages: 0x%016llx (len: %llx) failed: %d\n", vaddr, len, rc);
     return rc;
@@ -60,22 +55,28 @@ static int ioctl_get_pages(struct file *filp, unsigned long arg) {
   nents = sgt->nents;
   pr_info("PEER   : Get 0x%016llx (len: %llu) mapped to %d pages\n", vaddr, len,
           nents);
-  for_each_sg(sgt->sgl, sg, nents, i) {
-    if (i == 0) {
-      paddr = sg_dma_address(sg);
+
+  // Extract first page address
+  if (nents > 0) {
+    sg = sgt->sgl; // First entry
+    paddr = sg_dma_address(sg);
+    // Optional: Log all pages for debugging
+    for_each_sg(sgt->sgl, sg, nents, i) {
+      pr_info("PEER   : segment_%d dma_address 0x%llx length 0x%x dma_length "
+              "0x%x\n",
+              i, sg_dma_address(sg), sg->length, sg_dma_len(sg));
     }
-    pr_info("PEER   : segment_%d dma_address 0x%llx length 0x%x dma_length "
-            "0x%x\n",
-            i, sg_dma_address(sg), sg->length, sg_dma_len(sg));
+  } else {
+    paddr = 0; // No pages found
   }
 
   rc = rdma_interface->put_pages(&info);
   if (rc < 0) {
     pr_err("Could not put pages back: %d\n", rc);
-    return rc;
+    // Continue to copy back results if possible, but return error
   }
 
-  /* 将结果回写用户空间 */
+  /* Copy results back to user space */
   params.paddr = paddr;
   params.nents = nents;
   if (copy_to_user((void __user *)arg, &params, sizeof(params))) {
@@ -83,7 +84,8 @@ static int ioctl_get_pages(struct file *filp, unsigned long arg) {
     return -EFAULT;
   }
 
-  return 0;
+  /* Return original error code if put_pages failed, otherwise 0 */
+  return rc;
 }
 
 static int ioctl_dmabuf_get_pages(struct file *filp, unsigned long arg) {
@@ -105,15 +107,21 @@ static int ioctl_dmabuf_get_pages(struct file *filp, unsigned long arg) {
   len = params.length;
   dmabuf_fd = params.dmabuf_fd;
 
-  /* 通过文件描述符获取 DMA-BUF 对象 */
   dmabuf = dma_buf_get(dmabuf_fd);
   if (IS_ERR(dmabuf)) {
     rc = PTR_ERR(dmabuf);
-    pr_err("Get dmabuf failed: %d\n", rc);
+    pr_err("Get dmabuf (fd: %d) failed: %d\n", dmabuf_fd, rc);
     return rc;
   }
 
-  /* 创建缓冲区附件（用于后续映射） */
+  /* Check if dmabuf size matches expected length */
+  if (dmabuf->size < len) {
+    pr_warn("DMA-BUF size (%zu) is smaller than requested length (%llu)\n",
+            dmabuf->size, len);
+    // Decide if this is an error or just a warning
+    // len = dmabuf->size; // Optionally adjust length
+  }
+
   attach = dma_buf_attach(dmabuf, gpt_misc_dev.this_device);
   if (IS_ERR(attach)) {
     rc = PTR_ERR(attach);
@@ -121,35 +129,41 @@ static int ioctl_dmabuf_get_pages(struct file *filp, unsigned long arg) {
     goto fail_put;
   }
 
-  /* 实际执行物理地址映射 */
   sgt = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
   if (IS_ERR(sgt)) {
     rc = PTR_ERR(sgt);
-    pr_err("Map dmabuf failed: %d\n", rc);
+    pr_err("Map dmabuf attachment failed: %d\n", rc);
+    sgt = NULL;
     goto fail_detach;
   }
 
-  pr_info("DMA-BUF: Get 0x%016llx (len: %llu) mapped to %d pages\n", vaddr, len,
-          sgt->nents);
   nents = sgt->nents;
-  for_each_sg(sgt->sgl, sg, nents, i) {
-    if (i == 0) {
-      paddr = sg_dma_address(sg);
+  pr_info("DMA-BUF: Get 0x%016llx (len: %llu) (fd: %d)mapped to %d pages\n",
+          vaddr, len, dmabuf_fd, nents);
+
+  // Extract first page address
+  if (nents > 0) {
+    sg = sgt->sgl;
+    paddr = sg_dma_address(sg);
+    // Optional: Log all pages for debugging
+    for_each_sg(sgt->sgl, sg, nents, i) {
+      pr_info("DMA-BUF: segment_%d dma_address 0x%llx length 0x%x dma_length "
+              "0x%x\n",
+              i, sg_dma_address(sg), sg->length, sg_dma_len(sg));
     }
-    pr_info("DMA-BUF: segment_%d dma_address 0x%llx length 0x%x dma_length "
-            "0x%x\n",
-            i, sg_dma_address(sg), sg->length, sg_dma_len(sg));
+  } else {
+    paddr = 0; // No pages found
   }
 
-  /* 清理阶段 */
+  /* Cleanup */
   dma_buf_unmap_attachment(attach, sgt, DMA_BIDIRECTIONAL);
 fail_detach:
   dma_buf_detach(dmabuf, attach);
 fail_put:
   dma_buf_put(dmabuf);
 
-  /* 将结果回写用户空间 */
-  if (rc == 0) {
+  /* Copy results back to user space */
+  if (rc == 0) { // Only copy back if mapping was successful
     params.paddr = paddr;
     params.nents = nents;
     if (copy_to_user((void __user *)arg, &params, sizeof(params))) {
@@ -161,6 +175,7 @@ fail_put:
   return rc;
 }
 
+// --- IOCTL Dispatch ---
 static const struct ioctl_handler_map {
   int (*handler)(struct file *filp, unsigned long arg);
   unsigned int cmd;
@@ -170,98 +185,111 @@ static const struct ioctl_handler_map {
     {NULL, 0}};
 
 /*
- * gpt_unlocked_ioctl - 处理IOCTL命令
- * @filp: 文件结构指针
- * @cmd:  IOCTL命令号
- * @arg:  用户空间参数指针
- * 返回值： 0成功，负数为错误码
- * 核心功能：处理 GET_PAGES 和 DMABUF_GET_PAGES 命令
+ * gpt_unlocked_ioctl - Process ioctl commands
+ * @filp: file struct pointer
+ * @cmd:  ioctl command code
+ * @arg:  user space argument pointer
+ * Return: 0 on success, negative error code on failure
+ * Core function: dispatches ioctl commands to appropriate handlers.
  */
 static long gpt_unlocked_ioctl(struct file *filp, unsigned int cmd,
                                unsigned long arg) {
   int rc = -ENOTTY, i;
+
+  BUG_ON(rdma_interface == NULL);
+
   for (i = 0; handlers[i].handler != NULL; ++i) {
     if (cmd == handlers[i].cmd) {
       rc = handlers[i].handler(filp, arg);
       break;
     }
   }
+
+  if (handlers[i].handler == NULL) {
+    pr_warn("Unknown ioctl command received: 0x%x\n", cmd);
+  }
+
   return rc;
 }
 
-/* 文件操作结构体：定义驱动支持的操作 */
+/* File operations structure: defines driver supported operations */
 static const struct file_operations fops = {
-    .owner = THIS_MODULE,                 // 模块引用计数
-    .unlocked_ioctl = gpt_unlocked_ioctl, // IOCTL handler
+    .owner = THIS_MODULE,
+    .unlocked_ioctl = gpt_unlocked_ioctl,
 };
 
-/* misc设备定义 */
+/* Misc device definition */
 static struct miscdevice gpt_misc_dev = {
-    .minor = MISC_DYNAMIC_MINOR, // 自动分配次设备号
-    .name = GPT_DEVICE_NAME,     // 设备节点名称
-    .fops = &fops,               // 关联文件操作
-    .mode = 0666,                // 设备权限（rw-rw-rw-）
+    .minor = MISC_DYNAMIC_MINOR, // Auto-assign minor number
+    .name = GPT_DEVICE_NAME,     // Device node name (/dev/gpu_ptr_translator)
+    .fops = &fops,               // Associate file operations
+    .mode = S_IRUSR | S_IRGRP | S_IROTH, // Device Permission（r--r--r--）
 };
 
-/* 符号引用：动态获取AMD内核接口 */
+/* Symbol reference: dynamically get AMD kernel interface */
 static int (*p2p_query_rdma_interface)(const struct amd_rdma_interface **);
 
 /*
- * 模块初始化函数：
- * 1. 获取 RDMA 接口
- * 2. 注册 misc 设备
+ * Module initialization function:
+ * 1. Get RDMA interface
+ * 2. Register misc device
  */
 static int __init gpu_ptr_translator_init(void) {
   int rc;
 
-  /* 动态查找AMD内核符号 */
+  /* Dynamically look up AMD kernel symbol */
   p2p_query_rdma_interface =
       (int (*)(const struct amd_rdma_interface **))symbol_request(
           amdkfd_query_rdma_interface);
+
   if (!p2p_query_rdma_interface) {
     pr_err("Can not get symbol amdkfd_query_rdma_interface, please load "
            "amdgpu driver\n");
+    rdma_interface = NULL;
     return -ENOENT;
   }
 
-  /* 实际获取接口指针 */
+  /* Actually get the interface pointer */
   rc = p2p_query_rdma_interface(&rdma_interface);
   if (rc < 0) {
     pr_err("Can not get RDMA Interface (result = %d)\n", rc);
     goto err_symbol;
   }
 
-  /* 注册misc设备（自动创建设备节点） */
+  /* Register the misc device (creates /dev/gpu_ptr_translator) */
   rc = misc_register(&gpt_misc_dev);
   if (rc < 0) {
     pr_err("Can not register device (result = %d)\n", rc);
     goto err_symbol;
   }
 
-  pr_info("GPU Ptr Translator loaded\n");
+  pr_info("GPU Ptr Translator loaded (/dev/%s)\n", GPT_DEVICE_NAME);
   return 0;
 
 err_symbol:
   symbol_put(amdkfd_query_rdma_interface);
+  rdma_interface = NULL;
   return rc;
 }
 
 /*
- * 模块退出函数：
- * 1. 注销设备
- * 2. 释放符号引用
+ * Module exit function:
+ * 1. Deregister device
+ * 2. Release symbol reference
  */
 static void __exit gpu_ptr_translator_exit(void) {
-  /* 注销misc设备 */
+  /* Deregister the misc device */
   misc_deregister(&gpt_misc_dev);
 
-  /* 释放AMD接口符号引用 */
+  /* Release the AMD interface symbol reference if it was acquired */
   if (p2p_query_rdma_interface) {
     symbol_put(amdkfd_query_rdma_interface);
   }
+  rdma_interface = NULL;
+
   pr_info("GPU Translator unloaded\n");
 }
 
-/* 注册模块入口/出口 */
+/* Register module entry/exit points */
 module_init(gpu_ptr_translator_init);
 module_exit(gpu_ptr_translator_exit);
