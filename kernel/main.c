@@ -4,6 +4,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pid.h>
+#include <linux/ptrace.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
@@ -175,6 +176,130 @@ fail_put:
   return rc;
 }
 
+static loff_t gpt_lseek(struct file *file, loff_t offset, int orig) {
+  switch (orig) {
+  case 0:
+    file->f_pos = offset;
+    break;
+  case 1:
+    file->f_pos += offset;
+    break;
+  default:
+    return -EINVAL;
+  }
+  force_successful_syscall_return();
+  return file->f_pos;
+}
+
+typedef struct {
+  u64 pme;
+} gpt_pagemap_entry_t;
+
+#define PM_ENTRY_GPU_BYTES sizeof(gpt_pagemap_entry_t)
+#define PM_PFRAME_GPU_BITS 55
+#define PM_PFRAME_GPU_MASK GENMASK_ULL(PM_PFRAME_GPU_BITS - 1, 0)
+#define PM_GPU_PRESENT BIT_ULL(63) /* Page is physically mapped */
+
+static inline gpt_pagemap_entry_t make_gpt_pme(u64 paddr, u64 flags) {
+  return (gpt_pagemap_entry_t){
+      .pme = ((paddr >> PAGE_SHIFT) & PM_PFRAME_GPU_MASK) | flags};
+}
+
+static ssize_t gpt_read(struct file *file, char __user *buf, size_t count,
+                        loff_t *ppos) {
+  struct amd_p2p_info *info = NULL;
+  gpt_pagemap_entry_t *kernel_buf = NULL;
+  int ret = 0;
+  u64 start_pos, current_va, paddr;
+  size_t total_entries;
+
+  start_pos = *ppos;
+
+  // Align offset and count like pagemap
+  if (start_pos % PM_ENTRY_GPU_BYTES) {
+    pr_warn("gpt_read: File offset %llu not aligned to entry size %zu\n",
+            start_pos, PM_ENTRY_GPU_BYTES);
+    return -EINVAL;
+  }
+  if (count % PM_ENTRY_GPU_BYTES) {
+    pr_warn("gpt_read: Read count %zu not aligned to entry size %zu\n", count,
+            PM_ENTRY_GPU_BYTES);
+    return -EINVAL;
+  }
+
+  if (count == 0) {
+    return 0;
+  }
+
+  total_entries = count / PM_ENTRY_GPU_BYTES;
+  BUG_ON(total_entries == 0);
+
+  if (total_entries != 1) {
+    pr_warn("For now, only support one entry query");
+    return -EOPNOTSUPP;
+  }
+
+  current_va = start_pos;
+  if (current_va % PAGE_SIZE != 0) {
+    pr_warn("gpt_read: VA %llu not aligned to PAGE_SIZE %lu\n", current_va,
+            PAGE_SIZE);
+    return -EINVAL;
+  }
+
+  ret = rdma_interface->get_pages(current_va, PAGE_SIZE, NULL, NULL, &info,
+                                  NULL, NULL);
+  if (ret < 0) {
+    pr_err("gpt_read: get_pages failed for VA 0x%llx: %d\n", current_va, ret);
+    goto out;
+  }
+
+  /* Allocate Kernel Buffer */
+  kernel_buf = kmalloc_array(total_entries, PM_ENTRY_GPU_BYTES, GFP_KERNEL);
+  if (!kernel_buf) {
+    pr_err("gpt_read: kmalloc failed for %zu bytes\n", total_entries);
+    ret = -ENOMEM;
+    goto out_pages;
+  }
+
+  if (info->pages->nents != 1) {
+    pr_err("gpt_read: get_pages returned %d segments, expected 1\n",
+           info->pages->nents);
+    ret = -EINVAL;
+    goto out_pages;
+  }
+
+  paddr = sg_dma_address(info->pages->sgl);
+  *kernel_buf = make_gpt_pme(paddr, PM_GPU_PRESENT);
+
+  if (copy_to_user(buf, kernel_buf, count)) {
+    pr_err("gpt_read: copy_to_user failed for %zu bytes\n", total_entries);
+    ret = -EFAULT;
+    goto out_free;
+  }
+
+  // read should return count
+  if (ret == 0) {
+    ret = count;
+  }
+
+out_free:
+  kfree(kernel_buf);
+out_pages:
+  rdma_interface->put_pages(&info);
+out:
+  return ret;
+}
+
+static int gpt_open(struct inode *inode, struct file *filp) {
+  filp->private_data = NULL; // Initialize private data
+  return 0;
+}
+
+static int gpt_release(struct inode *inode, struct file *filp) {
+  filp->private_data = NULL; // Clear private data
+  return 0;
+}
+
 // --- IOCTL Dispatch ---
 static const struct ioctl_handler_map {
   int (*handler)(struct file *filp, unsigned long arg);
@@ -215,6 +340,10 @@ static long gpt_unlocked_ioctl(struct file *filp, unsigned int cmd,
 /* File operations structure: defines driver supported operations */
 static const struct file_operations fops = {
     .owner = THIS_MODULE,
+    .llseek = gpt_lseek,
+    .read = gpt_read,
+    .open = gpt_open,
+    .release = gpt_release,
     .unlocked_ioctl = gpt_unlocked_ioctl,
 };
 
