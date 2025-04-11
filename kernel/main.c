@@ -239,17 +239,16 @@ static ssize_t gpt_read(struct file *file, char __user *buf, size_t count,
     return -EOPNOTSUPP;
   }
 
-  current_va = start_pos;
+  current_va = start_pos * PAGE_SIZE / PM_ENTRY_GPU_BYTES;
   if (current_va % PAGE_SIZE != 0) {
     pr_warn("gpt_read: VA %llu not aligned to PAGE_SIZE %lu\n", current_va,
             PAGE_SIZE);
     return -EINVAL;
   }
 
-  ret = rdma_interface->get_pages(current_va, PAGE_SIZE, NULL, NULL, &info,
-                                  NULL, NULL);
+  ret = rdma_interface->get_pages(current_va, 1, NULL, NULL, &info, NULL, NULL);
   if (ret < 0) {
-    pr_err("gpt_read: get_pages failed for VA 0x%llx: %d\n", current_va, ret);
+    pr_err("gpt_read: get_pages failed for VA 0x%016llx: %d\n", current_va, ret);
     goto out;
   }
 
@@ -261,15 +260,18 @@ static ssize_t gpt_read(struct file *file, char __user *buf, size_t count,
     goto out_pages;
   }
 
-  if (info->pages->nents != 1) {
+  if (info == NULL || info->pages->nents == 0) {
+    pr_warn("gpt_read: VA 0x%016llx page not found\n", current_va);
+    *kernel_buf = make_gpt_pme(0, 0);
+  } else if (info->pages->nents == 1) {
+    paddr = sg_dma_address(info->pages->sgl);
+    *kernel_buf = make_gpt_pme(paddr, PM_GPU_PRESENT);
+  } else {
     pr_err("gpt_read: get_pages returned %d segments, expected 1\n",
            info->pages->nents);
     ret = -EINVAL;
     goto out_pages;
   }
-
-  paddr = sg_dma_address(info->pages->sgl);
-  *kernel_buf = make_gpt_pme(paddr, PM_GPU_PRESENT);
 
   if (copy_to_user(buf, kernel_buf, count)) {
     pr_err("gpt_read: copy_to_user failed for %zu bytes\n", total_entries);
