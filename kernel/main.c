@@ -200,11 +200,28 @@ typedef struct {
 #define PM_PFRAME_GPU_MASK GENMASK_ULL(PM_PFRAME_GPU_BITS - 1, 0)
 #define PM_GPU_PRESENT BIT_ULL(63) /* Page is physically mapped */
 
+/**
+ * @brief Creates a gpt_pagemap_entry_t.
+ * @param paddr Physical address (or 0 if not present/permitted).
+ * @param flags Flags (e.g., PM_GPU_PRESENT).
+ * @return The constructed pagemap entry.
+ */
 static inline gpt_pagemap_entry_t make_gpt_pme(u64 paddr, u64 flags) {
   return (gpt_pagemap_entry_t){
       .pme = ((paddr >> PAGE_SHIFT) & PM_PFRAME_GPU_MASK) | flags};
 }
 
+/**
+ * @brief Read implementation for the gpu_ptr_translator device.
+ * Mimics /proc/pid/pagemap: reads physical mapping info for GPU virtual pages.
+ *
+ * @param file File pointer.
+ * @param buf User buffer to write pagemap entries to.
+ * @param count Number of bytes requested by the user.
+ * @param ppos File offset pointer. Interpreted as byte offset into the GPU VA
+ * space.
+ * @return Number of bytes read, or negative error code.
+ */
 static ssize_t gpt_read(struct file *file, char __user *buf, size_t count,
                         loff_t *ppos) {
   struct amd_p2p_info *info = NULL;
@@ -239,7 +256,7 @@ static ssize_t gpt_read(struct file *file, char __user *buf, size_t count,
     return -EOPNOTSUPP;
   }
 
-  current_va = start_pos * PAGE_SIZE / PM_ENTRY_GPU_BYTES;
+  current_va = start_pos / PM_ENTRY_GPU_BYTES * PAGE_SIZE;
   if (current_va % PAGE_SIZE != 0) {
     pr_warn("gpt_read: VA %llu not aligned to PAGE_SIZE %lu\n", current_va,
             PAGE_SIZE);
@@ -248,7 +265,8 @@ static ssize_t gpt_read(struct file *file, char __user *buf, size_t count,
 
   ret = rdma_interface->get_pages(current_va, 1, NULL, NULL, &info, NULL, NULL);
   if (ret < 0) {
-    pr_err("gpt_read: get_pages failed for VA 0x%016llx: %d\n", current_va, ret);
+    pr_err("gpt_read: get_pages failed for VA 0x%016llx: %d\n", current_va,
+           ret);
     goto out;
   }
 
